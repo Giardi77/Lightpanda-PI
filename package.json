@@ -11,6 +11,7 @@
 		"LICENSE"
 	],
 	"scripts": {
+		"prepare": "bun run build",
 		"build": "tsc -p tsconfig.build.json",
 		"test": "vitest run",
 		"test:watch": "vitest",
