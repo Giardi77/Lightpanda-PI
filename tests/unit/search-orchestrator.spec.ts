@@ -1,5 +1,10 @@
 import { describe, expect, test } from "vitest";
-import { buildSearchUrl, truncateResults } from "../../src/search-orchestrator";
+import {
+	buildSearchUrl,
+	isFetchUrl,
+	normalizeFetchUrl,
+	truncateResults,
+} from "../../src/search-orchestrator";
 
 describe("search-orchestrator", () => {
 	describe("buildSearchUrl", () => {
@@ -11,6 +16,32 @@ describe("search-orchestrator", () => {
 		test("encodes special characters", () => {
 			const url = buildSearchUrl("hello & world");
 			expect(url).toContain("hello%20%26%20world");
+		});
+	});
+
+	describe("isFetchUrl", () => {
+		test("returns true for absolute http and https URLs", () => {
+			expect(isFetchUrl("https://lightpanda.io/docs")).toBe(true);
+			expect(isFetchUrl("http://example.com/page")).toBe(true);
+		});
+
+		test("returns false for search terms and unsupported schemes", () => {
+			expect(isFetchUrl("zig best practices")).toBe(false);
+			expect(isFetchUrl("ftp://example.com/file.txt")).toBe(false);
+		});
+	});
+
+	describe("normalizeFetchUrl", () => {
+		test("trims whitespace around a valid URL", () => {
+			expect(normalizeFetchUrl("  https://lightpanda.io/docs  ")).toBe(
+				"https://lightpanda.io/docs",
+			);
+		});
+
+		test("throws on invalid direct fetch URLs", () => {
+			expect(() => normalizeFetchUrl("lightpanda.io/docs")).toThrow(
+				"URL must be an absolute http(s) URL",
+			);
 		});
 	});
 

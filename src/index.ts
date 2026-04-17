@@ -1,7 +1,8 @@
 /**
- * Lightpanda Web Search Extension for PI
+ * Lightpanda Web Extension for PI
  *
- * Uses Lightpanda headless browser for web search with clean Markdown output.
+ * Uses Lightpanda headless browser for web search and direct URL fetches with
+ * clean Markdown output.
  */
 
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
@@ -14,7 +15,7 @@ import { Type } from "@sinclair/typebox";
 import { parseToStructured } from "./content-extractor";
 import { LightpandaNotFoundError, getInstallInstructions } from "./error-handler";
 import { LightpandaClient } from "./lightpanda-client";
-import { buildSearchUrl, truncateResults } from "./search-orchestrator";
+import { buildSearchUrl, normalizeFetchUrl, truncateResults } from "./search-orchestrator";
 import { checkForUpdates } from "./update-check.js";
 
 // Extension state
@@ -34,23 +35,27 @@ const state: ExtensionState = {
 };
 
 /**
- * Search the web using Lightpanda browser
+ * Supported output modes for Lightpanda tools.
  */
-async function searchWithLightpanda(
+type OutputFormat = "markdown" | "structured";
+
+/**
+ * Execute Lightpanda against a fully resolved target URL.
+ */
+async function runLightpandaFetch(
 	pi: ExtensionAPI,
-	query: string,
+	targetUrl: string,
+	sourceDetails: Record<string, unknown>,
 	signal: AbortSignal | undefined,
-	format: "markdown" | "structured" = "markdown",
+	format: OutputFormat = "markdown",
 	maxResults = 10,
 ): Promise<{ content: string; details: Record<string, unknown> }> {
 	if (!state.client || !state.binaryPath) {
 		throw new LightpandaNotFoundError("Lightpanda client not initialized");
 	}
 
-	const searchUrl = buildSearchUrl(query);
-
 	// Use Lightpanda's dump mode for clean markdown extraction
-	const args = ["fetch", searchUrl, "--dump", "markdown"];
+	const args = ["fetch", targetUrl, "--dump", "markdown"];
 
 	try {
 		// Execute Lightpanda with timeout
@@ -80,8 +85,8 @@ async function searchWithLightpanda(
 		// Format output
 		let output: string;
 		const details: Record<string, unknown> = {
-			query,
-			url: searchUrl,
+			...sourceDetails,
+			url: targetUrl,
 			format,
 			timestamp: new Date().toISOString(),
 		};
@@ -102,8 +107,102 @@ async function searchWithLightpanda(
 			details,
 		};
 	} catch (error) {
-		throw new Error(`Search failed: ${error instanceof Error ? error.message : String(error)}`);
+		throw new Error(
+			`Lightpanda fetch failed: ${error instanceof Error ? error.message : String(error)}`,
+		);
 	}
+}
+
+/**
+ * Search the web using Lightpanda browser and DuckDuckGo Lite.
+ */
+async function searchWithLightpanda(
+	pi: ExtensionAPI,
+	query: string,
+	signal: AbortSignal | undefined,
+	format: OutputFormat = "markdown",
+	maxResults = 10,
+): Promise<{ content: string; details: Record<string, unknown> }> {
+	return runLightpandaFetch(
+		pi,
+		buildSearchUrl(query),
+		{ mode: "search", query },
+		signal,
+		format,
+		maxResults,
+	);
+}
+
+/**
+ * Fetch a specific URL directly using Lightpanda browser.
+ */
+async function fetchUrlWithLightpanda(
+	pi: ExtensionAPI,
+	url: string,
+	signal: AbortSignal | undefined,
+	format: OutputFormat = "markdown",
+	maxResults = 10,
+): Promise<{ content: string; details: Record<string, unknown> }> {
+	const targetUrl = normalizeFetchUrl(url);
+	return runLightpandaFetch(
+		pi,
+		targetUrl,
+		{ mode: "fetch_url", requestedUrl: targetUrl },
+		signal,
+		format,
+		maxResults,
+	);
+}
+
+/**
+ * Apply output truncation and persist full output when needed.
+ */
+async function buildToolResponse(
+	result: { content: string; details: Record<string, unknown> },
+	format: OutputFormat,
+): Promise<{
+	content: Array<{ type: "text"; text: string }>;
+	details: Record<string, unknown>;
+}> {
+	// Safety-net truncation: keep the TOP of the content (most-relevant results).
+	// truncateHead keeps the first N lines/bytes; truncateTail would keep the bottom
+	// (footer / low-ranked results), which is exactly wrong for ranked search output.
+	const truncated = truncateHead(result.content, { maxBytes: 50000, maxLines: 2000 });
+
+	let text = truncated.content;
+	let fullOutputPath: string | undefined;
+
+	// When the safety net trips, persist the full pre-truncation content to a
+	// temp file and surface the path. The LLM can then use its built-in read
+	// tool to paginate into the remainder by line offset — idiomatic pi-mono
+	// pattern (see coding-agent/examples/extensions/truncated-tool.ts).
+	if (truncated.truncated) {
+		const tempDir = await mkdtemp(join(tmpdir(), "pi-lightpanda-search-"));
+		state.tempDirs.push(tempDir);
+		fullOutputPath = join(tempDir, format === "structured" ? "output.json" : "output.md");
+		await writeFile(fullOutputPath, result.content, "utf8");
+
+		const omittedLines = truncated.totalLines - truncated.outputLines;
+		const omittedBytes = truncated.totalBytes - truncated.outputBytes;
+		const limit = truncated.truncatedBy === "bytes" ? "byte" : "line";
+		text += `\n\n⚠️ Output truncated: showing ${truncated.outputLines}/${truncated.totalLines} lines (${formatSize(truncated.outputBytes)}/${formatSize(truncated.totalBytes)}, ${limit} limit hit). ${omittedLines} lines (${formatSize(omittedBytes)}) omitted.`;
+		text += `\nFull output saved to: ${fullOutputPath}`;
+		text += `\nTo read the remainder, call your read tool against that path with offset ${truncated.outputLines + 1} (or any line range you need). Do not retry the same Lightpanda tool call expecting a 'next page' — it is single-shot.`;
+	}
+
+	return {
+		content: [{ type: "text", text }],
+		details: {
+			...result.details,
+			truncated: truncated.truncated,
+			truncatedBy: truncated.truncatedBy,
+			totalLines: truncated.totalLines,
+			totalBytes: truncated.totalBytes,
+			outputLines: truncated.outputLines,
+			outputBytes: truncated.outputBytes,
+			...(fullOutputPath ? { fullOutputPath } : {}),
+		},
+	};
 }
 
 /**
@@ -125,7 +224,7 @@ export default function lightpandaSearchExtension(pi: ExtensionAPI) {
 			state.client = client;
 			state.binaryPath = binaryPath;
 
-			ctx.ui.notify(`Lightpanda search ready (${binaryPath})`, "info");
+			ctx.ui.notify(`Lightpanda web tools ready (${binaryPath})`, "info");
 
 			// Check for extension updates (non-blocking)
 			void checkForUpdates(pi).then((info) => {
@@ -167,11 +266,12 @@ export default function lightpandaSearchExtension(pi: ExtensionAPI) {
 		name: "tff-search_web",
 		label: "Search Web",
 		description:
-			"Search the web using Lightpanda headless browser. Returns clean Markdown or structured JSON results. When output exceeds the 50KB/2000-line safety limit, the top-ranked results are returned inline and the FULL output is written to a temp file whose path is included in the truncation notice — use your read tool against that path to fetch any remaining content.",
-		promptSnippet: "Search the web for current information",
+			"Search the web using DuckDuckGo Lite through Lightpanda headless browser. Use this when you need discovery or current information but do not already have a specific page URL. Returns clean Markdown or structured JSON results. When output exceeds the 50KB/2000-line safety limit, the top-ranked results are returned inline and the FULL output is written to a temp file whose path is included in the truncation notice — use your read tool against that path to fetch any remaining content.",
+		promptSnippet: "Search the web when you need discovery and do not already have a URL",
 		promptGuidelines: [
 			"This tool is read-only (no side effects). Safe to call in parallel with other read-only tools.",
-			"Use this tool when you need current information from the web",
+			"Use this tool when you need to discover relevant pages or gather current information from the web.",
+			"If you already know the exact page URL you want, use tff-fetch_url instead of this search tool.",
 			"Prefer markdown format for reading content",
 			"Use structured format when you need to extract specific data fields",
 			"If the result ends with a truncation notice, the inline output was capped at 50KB/2000 lines and the full output has been written to a temp file. To see the rest, call your read tool against the path in the notice with an offset past the inline portion (e.g., read(path, offset=2001)). Do NOT call tff-search_web again with the same arguments expecting a 'next page' — it is single-shot and would only re-fetch the same results.",
@@ -195,50 +295,51 @@ export default function lightpandaSearchExtension(pi: ExtensionAPI) {
 				format,
 				params.max_results ?? 10,
 			);
-
-			// Safety-net truncation: keep the TOP of the content (most-relevant results).
-			// truncateHead keeps the first N lines/bytes; truncateTail would keep the bottom
-			// (footer / low-ranked results), which is exactly wrong for ranked search output.
-			const truncated = truncateHead(result.content, { maxBytes: 50000, maxLines: 2000 });
-
-			let text = truncated.content;
-			let fullOutputPath: string | undefined;
-
-			// When the safety net trips, persist the full pre-truncation content to a
-			// temp file and surface the path. The LLM can then use its built-in read
-			// tool to paginate into the remainder by line offset — idiomatic pi-mono
-			// pattern (see coding-agent/examples/extensions/truncated-tool.ts).
-			if (truncated.truncated) {
-				const tempDir = await mkdtemp(join(tmpdir(), "pi-lightpanda-search-"));
-				state.tempDirs.push(tempDir);
-				fullOutputPath = join(tempDir, format === "structured" ? "output.json" : "output.md");
-				await writeFile(fullOutputPath, result.content, "utf8");
-
-				const omittedLines = truncated.totalLines - truncated.outputLines;
-				const omittedBytes = truncated.totalBytes - truncated.outputBytes;
-				const limit = truncated.truncatedBy === "bytes" ? "byte" : "line";
-				text += `\n\n⚠️ Output truncated: showing ${truncated.outputLines}/${truncated.totalLines} lines (${formatSize(truncated.outputBytes)}/${formatSize(truncated.totalBytes)}, ${limit} limit hit). ${omittedLines} lines (${formatSize(omittedBytes)}) omitted.`;
-				text += `\nFull output saved to: ${fullOutputPath}`;
-				text += `\nTo read the remainder, call your read tool against that path with offset ${truncated.outputLines + 1} (or any line range you need). Do not retry tff-search_web — it is single-shot.`;
-			}
-
-			return {
-				content: [{ type: "text", text }],
-				details: {
-					...result.details,
-					truncated: truncated.truncated,
-					truncatedBy: truncated.truncatedBy,
-					totalLines: truncated.totalLines,
-					totalBytes: truncated.totalBytes,
-					outputLines: truncated.outputLines,
-					outputBytes: truncated.outputBytes,
-					...(fullOutputPath ? { fullOutputPath } : {}),
-				},
-			};
+			return buildToolResponse(result, format);
 		},
 	});
 
 	pi.registerTool(searchTool);
+
+	const fetchUrlTool = defineTool({
+		name: "tff-fetch_url",
+		label: "Fetch URL",
+		description:
+			"Fetch a specific webpage directly using Lightpanda headless browser. Use this when you already know the exact page URL and want the page content rather than search results. Returns clean Markdown or structured JSON results. When output exceeds the 50KB/2000-line safety limit, the inline output is capped and the FULL output is written to a temp file whose path is included in the truncation notice.",
+		promptSnippet: "Fetch a specific webpage directly when you already know its URL",
+		promptGuidelines: [
+			"This tool is read-only (no side effects). Safe to call in parallel with other read-only tools.",
+			"Use this tool when you already know the exact page URL or when another tool has already found the page you want to open.",
+			"Pass a full absolute http or https URL. Do not pass search keywords here.",
+			"If you need to discover a page first, use tff-search_web instead of this direct fetch tool.",
+			"Prefer markdown format for reading content",
+			"Use structured format when you need to extract specific data fields",
+			"If the result ends with a truncation notice, the inline output was capped at 50KB/2000 lines and the full output has been written to a temp file. To see the rest, call your read tool against the path in the notice with an offset past the inline portion (e.g., read(path, offset=2001)). Do NOT call tff-fetch_url again with the same URL expecting a 'next page' — it is single-shot and would only re-fetch the same page.",
+		],
+		parameters: Type.Object({
+			url: Type.String({ description: "Absolute http(s) URL to fetch" }),
+			format: Type.Optional(
+				StringEnum(["markdown", "structured"] as const, { description: "Output format" }),
+			),
+			max_results: Type.Optional(
+				Type.Number({ description: "Maximum results (1-50, default 10)" }),
+			),
+		}),
+
+		async execute(_toolCallId, params, signal, _onUpdate, _ctx) {
+			const format = params.format ?? "markdown";
+			const result = await fetchUrlWithLightpanda(
+				pi,
+				params.url,
+				signal,
+				format,
+				params.max_results ?? 10,
+			);
+			return buildToolResponse(result, format);
+		},
+	});
+
+	pi.registerTool(fetchUrlTool);
 
 	// Register toggle command
 	pi.registerCommand("toggle-lightpanda-search", {
